@@ -15,6 +15,9 @@ _lock = threading.RLock()
 _jobs = {}
 _tokens = {}
 
+# Files awaiting deletion, even after their expired token is removed.
+_pending_delete = set()
+
 
 def _safe_path(file_path):
     path = Path(file_path).resolve()
@@ -59,7 +62,6 @@ def update_job(job_id, **changes):
 
         job.update(changes)
         job["updated_at"] = time.time()
-
         return True
 
 
@@ -85,6 +87,10 @@ def issue_download_token(job_id, file_path):
             "expires_at": expires_at,
         }
 
+        # If this file was previously queued for deletion, an active
+        # token now protects it until that token expires.
+        _pending_delete.discard(str(path))
+
         job.update({
             "status": "completed",
             "file_path": str(path),
@@ -106,6 +112,7 @@ def resolve_download_token(token):
             return None
 
         if now >= entry["expires_at"]:
+            _pending_delete.add(entry["file_path"])
             _tokens.pop(token, None)
             return None
 
@@ -124,34 +131,47 @@ def resolve_download_token(token):
 
 def cleanup_expired_files():
     now = time.time()
-    expired_paths = set()
 
     with _lock:
+        # Expired tokens queue their files for deletion before removal.
         for token, entry in list(_tokens.items()):
             if now >= entry["expires_at"]:
-                try:
-                    expired_paths.add(
-                        _safe_path(entry["file_path"])
-                    )
-                except (ValueError, OSError):
-                    pass
-
+                _pending_delete.add(entry["file_path"])
                 _tokens.pop(token, None)
 
+        # A file must stay if any valid token still references it.
         active_paths = {
             entry["file_path"]
             for entry in _tokens.values()
+            if now < entry["expires_at"]
         }
+
+        paths_to_delete = [
+            path for path in _pending_delete
+            if path not in active_paths
+        ]
 
         for job_id, job in list(_jobs.items()):
             if now - job["created_at"] > JOB_RETENTION_SECONDS:
                 _jobs.pop(job_id, None)
 
-    for path in expired_paths:
-        if str(path) in active_paths:
-            continue
-
+    # Do filesystem operations outside the registry lock.
+    for file_path in paths_to_delete:
         try:
-            _safe_path(path).unlink(missing_ok=True)
+            path = _safe_path(file_path)
+            path.unlink(missing_ok=True)
+
+            with _lock:
+                # Recheck active tokens before clearing the pending record.
+                still_active = any(
+                    entry["file_path"] == str(path)
+                    and time.time() < entry["expires_at"]
+                    for entry in _tokens.values()
+                )
+
+                if not still_active:
+                    _pending_delete.discard(str(path))
+
         except (OSError, ValueError):
+            # Keep the path queued so a later cleanup pass can retry.
             pass
