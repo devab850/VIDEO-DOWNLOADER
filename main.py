@@ -155,14 +155,18 @@ def safe_info(url: str):
 
 
 def is_direct_mp4_info(info):
-    """Recognize yt-dlp's single direct MP4 format when codec metadata is absent."""
+    """Recognize a single direct MP4 even when Generic/HTML5 labels it format_id='0'.
+
+    Some pages expose one direct MP4 URL but omit codec metadata. In that specific
+    single-format case, the actual format_id may be '0', 'mp4', or another extractor
+    identifier; requiring the literal ID 'mp4' incorrectly rejects valid media.
+    """
     formats = info.get("formats") or []
     if len(formats) != 1:
         return False
     item = formats[0]
     return (
         bool(item.get("url"))
-        and str(item.get("format_id", "")) == "mp4"
         and (item.get("ext") or "").lower() == "mp4"
         and item.get("vcodec") in (None, "")
         and item.get("acodec") in (None, "")
@@ -186,9 +190,10 @@ def public_formats(info):
 
         has_video = bool(vcodec and vcodec != "none")
         has_audio = bool(acodec and acodec != "none")
-        # yt-dlp's Generic extractor may expose one direct MP4 URL without codec
-        # metadata. Treat only this exact single-format shape as a video fallback.
-        if direct_mp4 and format_id == "mp4":
+        # A single direct MP4 may have an extractor ID such as '0', not 'mp4'.
+        # is_direct_mp4_info() has already restricted this fallback to one MP4 URL
+        # with absent codec metadata, so it is safe to mark that sole format as video.
+        if direct_mp4:
             has_video = True
         if not has_video and not has_audio:
             continue
