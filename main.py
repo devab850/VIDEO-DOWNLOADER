@@ -112,7 +112,11 @@ def validate_public_http_url(raw_url: str) -> str:
 
 
 def safe_info(url: str):
+   
     opts = {
+         "cachedir": False,
+    "force_generic_extractor": False,
+"verbose": True,
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -122,7 +126,7 @@ def safe_info(url: str):
         "retries": 1,
         "ignoreerrors": False,
         "no_color": True,
-        "cachedir": False,
+        
     }
 
     with yt_dlp.YoutubeDL(opts) as ydl:
