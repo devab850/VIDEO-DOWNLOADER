@@ -213,19 +213,39 @@ def analyze(req: AnalyzeRequest):
 
     try:
         info = safe_info(url)
-        print(
-            "FORMAT DEBUG:",
-            "extractor=", info.get("extractor") if info else None,
-            "format_count=", len((info or {}).get("formats") or []),
-            "keys=", sorted((info or {}).keys()),
-            flush=True,
-        )
 
         if not info:
             raise HTTPException(
                 422,
                 "Video information could not be found.",
             )
+
+        print(
+            "FORMAT DETAILS:",
+            [
+                {
+                    "format_id": item.get("format_id"),
+                    "ext": item.get("ext"),
+                    "vcodec": item.get("vcodec"),
+                    "acodec": item.get("acodec"),
+                    "height": item.get("height"),
+                    "has_url": bool(item.get("url")),
+                }
+                for item in (info.get("formats") or [])
+            ],
+            flush=True,
+        )
+
+        print(
+            "FORMAT DEBUG:",
+            "extractor=", info.get("extractor"),
+            "format_count=", len(info.get("formats") or []),
+            "keys=", sorted(info.keys()),
+            flush=True,
+        )
+
+
+       
 
         formats = public_formats(info)
         video_qualities = available_video_qualities(formats)
