@@ -1,17 +1,32 @@
+
 import ipaddress
-import json
 import socket
+import threading
+import time
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl, Field
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 import yt_dlp
 
-app = FastAPI(title="DEVA Universal Video Downloader API", version="0.1.0")
+from download_manager import (
+    STORAGE_DIR,
+    create_job,
+    get_job,
+    update_job,
+    issue_download_token,
+    resolve_download_token,
+    cleanup_expired_files,
+)
 
-# For a public deployment, replace "*" with your exact Blogger origin, e.g.
-# https://yourblog.blogspot.com and your custom domain if any.
+app = FastAPI(
+    title="DEVA Universal Video Downloader API",
+    version="0.2.0",
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,40 +36,75 @@ app.add_middleware(
 )
 
 MAX_URL_LENGTH = 2048
-MAX_DURATION_SECONDS = 4 * 60 * 60  # safety limit for this starter service
+MAX_DURATION_SECONDS = 4 * 60 * 60
 MAX_FILE_MB = 1024
+CLEANUP_INTERVAL_SECONDS = 60
+
+BLOCKED_HOSTS = {
+    "youtube.com",
+    "youtu.be",
+    "instagram.com",
+}
+
+_cleanup_thread_started = False
+
 
 class AnalyzeRequest(BaseModel):
     url: str = Field(min_length=8, max_length=MAX_URL_LENGTH)
 
+
 def validate_public_http_url(raw_url: str) -> str:
-    """Basic URL validation. For production, also enforce network egress controls."""
     raw_url = raw_url.strip()
+
     if len(raw_url) > MAX_URL_LENGTH:
         raise HTTPException(400, "URL is too long.")
+
     parsed = urlparse(raw_url)
+
     if parsed.scheme not in ("http", "https"):
-        raise HTTPException(400, "Only public HTTP/HTTPS URLs are supported.")
+        raise HTTPException(400, "Only HTTP/HTTPS URLs are supported.")
+
     if not parsed.hostname or parsed.username or parsed.password:
         raise HTTPException(400, "Please enter a valid public video URL.")
+
     host = parsed.hostname.rstrip(".").lower()
-    if host in ("localhost", "localhost.localdomain"):
-        raise HTTPException(400, "Private/local URLs are not allowed.")
+
+    if any(
+        host == blocked or host.endswith("." + blocked)
+        for blocked in BLOCKED_HOSTS
+    ):
+        raise HTTPException(
+            400,
+            "This source is not supported by this service.",
+        )
+
     try:
         infos = socket.getaddrinfo(host, None)
-        ips = {ipaddress.ip_address(info[4][0].split("%")[0]) for info in infos}
-        if not ips or any(
-            ip.is_private or ip.is_loopback or ip.is_link_local or
-            ip.is_reserved or ip.is_multicast or ip.is_unspecified
-            for ip in ips
-        ):
-            raise HTTPException(400, "Private or non-public network addresses are not allowed.")
+        ips = {
+            ipaddress.ip_address(info[4][0].split("%")[0])
+            for info in infos
+        }
+
+        if not ips or any(not ip.is_global for ip in ips):
+            raise HTTPException(
+                400,
+                "Private or non-public network addresses are not allowed.",
+            )
+
     except socket.gaierror:
-        raise HTTPException(400, "The website hostname could not be resolved.")
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, ""))
+        raise HTTPException(400, "Website hostname could not be resolved.")
+
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        parsed.query,
+        "",
+    ))
+
 
 def safe_info(url: str):
-    # No cookies, browser profiles, login sessions, DRM, or private credentials.
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -65,83 +115,284 @@ def safe_info(url: str):
         "retries": 1,
         "ignoreerrors": False,
         "no_color": True,
-        "extract_flat": False,
         "cachedir": False,
     }
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
+
+def public_formats(info):
+    result = []
+
+    for item in info.get("formats") or []:
+        if not item.get("url"):
+            continue
+
+        vcodec = item.get("vcodec")
+        acodec = item.get("acodec")
+
+        if vcodec == "none" and acodec == "none":
+            continue
+
+        result.append({
+            "format_id": str(item.get("format_id", "")),
+            "ext": item.get("ext"),
+            "height": item.get("height"),
+            "width": item.get("width"),
+            "filesize": (
+                item.get("filesize")
+                or item.get("filesize_approx")
+            ),
+            "has_video": vcodec not in (None, "none"),
+            "has_audio": acodec not in (None, "none"),
+            "note": (item.get("format_note") or "")[:80],
+        })
+
+    result.sort(
+        key=lambda item: (
+            item.get("height") or 0,
+            item.get("has_audio", False),
+        ),
+        reverse=True,
+    )
+
+    return result[:40]
+
+
 @app.get("/")
 def root():
-    return {"service": "DEVA Universal Video Downloader API", "status": "ok"}
+    return {
+        "service": "DEVA Universal Video Downloader API",
+        "status": "ok",
+    }
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
     url = validate_public_http_url(req.url)
+
     try:
         info = safe_info(url)
+
         if not info:
-            raise HTTPException(422, "Video information could not be found.")
-        formats = []
-        for f in (info.get("formats") or []):
-            # Return metadata only; the browser is not given extractor stream URLs.
-            if not f.get("url"):
-                continue
-            vcodec = f.get("vcodec")
-            acodec = f.get("acodec")
-            if vcodec == "none" and acodec == "none":
-                continue
-            height = f.get("height")
-            ext = f.get("ext")
-            fmt = {
-                "format_id": str(f.get("format_id", "")),
-                "ext": ext,
-                "height": height,
-                "width": f.get("width"),
-                "filesize": f.get("filesize") or f.get("filesize_approx"),
-                "has_video": vcodec not in (None, "none"),
-                "has_audio": acodec not in (None, "none"),
-                "note": (f.get("format_note") or "")[:80],
-            }
-            formats.append(fmt)
-        formats.sort(key=lambda x: (x.get("height") or 0, x.get("has_audio", False)), reverse=True)
+            raise HTTPException(
+                422,
+                "Video information could not be found.",
+            )
+
+        formats = public_formats(info)
+
         return {
             "title": (info.get("title") or "Video")[:300],
             "thumbnail": info.get("thumbnail"),
             "duration": info.get("duration"),
-            "uploader": (info.get("uploader") or info.get("channel") or "")[:150],
-            "webpage_url": info.get("webpage_url") or url,
-            "extractor": info.get("extractor_key") or info.get("extractor") or "Unknown",
-            "formats": formats[:40],
+            "uploader": (
+                info.get("uploader") or info.get("channel") or ""
+            )[:150],
+            "extractor": (
+                info.get("extractor_key")
+                or info.get("extractor")
+                or "Unknown"
+            ),
+            "formats": formats,
             "download_supported": bool(formats),
-            "notice": "Only use for content you own or are authorized to download. DRM-protected, private, login-only, and restricted content is not supported."
+            "notice": (
+                "Only download content you own or are authorized "
+                "to download. Restricted and DRM-protected content "
+                "is not supported."
+            ),
         }
+
     except HTTPException:
         raise
-    except Exception as exc:
-        # Avoid exposing internal stack traces or sensitive extractor details.
-        msg = str(exc).lower()
-        if "unsupported url" in msg or "not supported" in msg:
-            detail = "This website or video format is not supported by the current engine."
-        elif "drm" in msg:
-            detail = "DRM-protected content is not supported."
-        else:
-            detail = "Could not analyze this link. It may be unsupported, private, restricted, or temporarily unavailable."
-        raise HTTPException(422, detail)
+    except Exception:
+        raise HTTPException(
+            422,
+            "Could not analyze this link. It may be unsupported, "
+            "restricted, or temporarily unavailable.",
+        )
 
-@app.post("/api/download")
-def download(req: AnalyzeRequest):
-    # Deliberately not implemented as a remote server-side file relay in this starter:
-    # relaying arbitrary files can create abuse, bandwidth, and security risks.
-    # Use the platform's official download option or download directly from a lawful
-    # direct media URL. A production implementation needs authentication, quotas,
-    # egress controls, storage policy, and explicit rights checks.
-    validate_public_http_url(req.url)
-    raise HTTPException(
-        501,
-        "Server-side download relay is disabled in this starter. Use the source's authorized download link, or configure a protected download worker for content you own or have permission to download."
+
+def process_download(job_id: str, url: str):
+    try:
+        update_job(job_id, status="processing", error=None)
+
+        # Revalidate immediately before processing.
+        url = validate_public_http_url(url)
+        info = safe_info(url)
+
+        if not info:
+            raise ValueError("Video information unavailable.")
+
+        duration = info.get("duration")
+
+        if duration and duration > MAX_DURATION_SECONDS:
+            raise ValueError("Video exceeds the duration limit.")
+
+        formats = public_formats(info)
+
+        if not formats:
+            raise ValueError("No supported downloadable formats found.")
+
+        output_template = str(
+            STORAGE_DIR / f"{job_id}.%(ext)s"
+        )
+
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "socket_timeout": 20,
+            "retries": 1,
+            "extractor_retries": 1,
+            "cachedir": False,
+            "max_filesize": MAX_FILE_MB * 1024 * 1024,
+            "format": (
+                "best[acodec!=none][vcodec!=none]/"
+                "best"
+            ),
+            "outtmpl": output_template,
+            "overwrites": False,
+            "continuedl": False,
+        }
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+
+        candidates = [
+            path for path in STORAGE_DIR.glob(f"{job_id}.*")
+            if path.is_file()
+            and not path.name.endswith((".part", ".ytdl"))
+        ]
+
+        if not candidates:
+            raise ValueError("Download did not produce a completed file.")
+
+        file_path = max(candidates, key=lambda path: path.stat().st_size)
+
+        if file_path.stat().st_size > MAX_FILE_MB * 1024 * 1024:
+            file_path.unlink(missing_ok=True)
+            raise ValueError("Downloaded file exceeds the size limit.")
+
+        token, expires_at = issue_download_token(job_id, file_path)
+
+        update_job(
+            job_id,
+            status="completed",
+            download_token=token,
+            download_expires_at=expires_at,
+            file_name=file_path.name,
+        )
+
+    except Exception:
+        update_job(
+            job_id,
+            status="failed",
+            error=(
+                "Download failed. The source may be unsupported, "
+                "restricted, or temporarily unavailable."
+            ),
+        )
+
+
+@app.post("/api/download", status_code=202)
+def download(req: AnalyzeRequest, background_tasks: BackgroundTasks):
+    url = validate_public_http_url(req.url)
+
+    job = create_job()
+
+    background_tasks.add_task(
+        process_download,
+        job["job_id"],
+        url,
     )
+
+    return {
+        "job_id": job["job_id"],
+        "status": "queued",
+        "status_url": f"/api/jobs/{job['job_id']}",
+    }
+
+
+@app.get("/api/jobs/{job_id}")
+def download_status(job_id: str):
+    job = get_job(job_id)
+
+    if not job:
+        raise HTTPException(404, "Download job not found.")
+
+    response = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "error": job.get("error"),
+    }
+
+    if job["status"] == "completed":
+        response["download_url"] = (
+            f"/api/files/{job['download_token']}"
+        )
+        response["expires_at"] = job["download_expires_at"]
+
+    return response
+
+
+@app.get("/api/files/{token}")
+def get_download_file(token: str):
+    path = resolve_download_token(token)
+
+    if path is None:
+        raise HTTPException(
+            404,
+            "Download link is invalid, expired, or unavailable.",
+        )
+
+    return FileResponse(
+        path=path,
+        filename=path.name,
+        media_type="application/octet-stream",
+    )
+
+
+def cleanup_loop():
+    while True:
+        try:
+            cleanup_expired_files()
+
+            # Remove abandoned files left by failed jobs or restarts.
+            now = time.time()
+
+            for path in STORAGE_DIR.iterdir():
+                try:
+                    if (
+                        path.is_file()
+                        and now - path.stat().st_mtime > 2 * 60 * 60
+                    ):
+                        path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        except Exception:
+            pass
+
+        time.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+def start_cleanup_worker():
+    global _cleanup_thread_started
+
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not _cleanup_thread_started:
+        threading.Thread(
+            target=cleanup_loop,
+            daemon=True,
+            name="deva-file-cleanup",
+        ).start()
+        _cleanup_thread_started = True
