@@ -355,8 +355,7 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             download_expires_at=expires_at,
             file_name=file_path.name,
         )
-
-       except Exception as exc:
+    except Exception as exc:
         print(
             f"DOWNLOAD ERROR [{job_id}]: {type(exc).__name__}: {exc}",
             flush=True,
