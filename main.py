@@ -1,5 +1,6 @@
 
 import ipaddress
+import json
 import socket
 import subprocess
 import threading
@@ -41,6 +42,26 @@ MAX_URL_LENGTH = 2048
 MAX_DURATION_SECONDS = 4 * 60 * 60
 MAX_FILE_MB = 1024
 CLEANUP_INTERVAL_SECONDS = 60
+
+# The source tested by the user requires this cookie-check value and a browser-like UA.
+# Keep the cookie restricted to that source family; do not send it to unrelated sites.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+)
+COOKIE_CHECK_HOSTS = {"xxnx.kim"}
+
+
+def headers_for_url(url: str) -> dict:
+    """Build source-specific headers without adding the cookie to unrelated sites."""
+    headers = {
+        "User-Agent": BROWSER_USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    host = (urlparse(url).hostname or "").rstrip(".").lower()
+    if any(host == domain or host.endswith("." + domain) for domain in COOKIE_CHECK_HOSTS):
+        headers["Cookie"] = "_sv=1"
+    return headers
 
 BLOCKED_HOSTS = {
     "youtube.com",
@@ -116,8 +137,7 @@ def safe_info(url: str):
    
     opts = {
          "cachedir": False,
-    "force_generic_extractor": False,
-"verbose": True,
+        "http_headers": headers_for_url(url),
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -322,6 +342,44 @@ def analyze(req: AnalyzeRequest):
         )
 
 
+
+def validate_output_file(file_path: Path, download_type: str) -> None:
+    """Reject empty, unreadable, or stream-less outputs before marking a job complete."""
+    if not file_path.is_file() or file_path.stat().st_size < 1024:
+        raise ValueError("Downloaded file is missing or too small to be valid.")
+
+    command = [
+        "ffprobe", "-v", "error", "-show_streams", "-show_format",
+        "-of", "json", str(file_path),
+    ]
+    result = subprocess.run(
+        command, capture_output=True, text=True, timeout=60, check=False
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()[-300:]
+        raise ValueError("Downloaded file failed media validation." + (f" {detail}" if detail else ""))
+
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("Downloaded file returned invalid media metadata.") from exc
+
+    streams = data.get("streams") or []
+    has_video = any(s.get("codec_type") == "video" for s in streams)
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    if download_type == "video" and not has_video:
+        raise ValueError("Downloaded file contains no readable video stream.")
+    if download_type in ("audio_mp3", "audio_original") and not has_audio:
+        raise ValueError("Downloaded file contains no readable audio stream.")
+
+    duration = (data.get("format") or {}).get("duration")
+    try:
+        if duration is not None and float(duration) <= 0:
+            raise ValueError("Downloaded file has an invalid duration.")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Downloaded file has an invalid duration.") from exc
+
+
 def process_download(job_id: str, url: str, download_type: str = "video", quality: str = "auto"):
     try:
         update_job(job_id, status="processing", error=None)
@@ -378,6 +436,7 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             "retries": 1,
             "extractor_retries": 1,
             "cachedir": False,
+            "http_headers": headers_for_url(url),
             "max_filesize": MAX_FILE_MB * 1024 * 1024,
             "format": format_selector,
             "outtmpl": output_template,
@@ -440,6 +499,8 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
         if file_path.stat().st_size > MAX_FILE_MB * 1024 * 1024:
             file_path.unlink(missing_ok=True)
             raise ValueError("Downloaded file exceeds the size limit.")
+
+        validate_output_file(file_path, download_type)
 
         token, expires_at = issue_download_token(job_id, file_path)
         update_job(
