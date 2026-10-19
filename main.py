@@ -356,16 +356,11 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             file_name=file_path.name,
         )
 
-    except Exception as exc:
-                print(f"DOWNLOAD ERROR [{job_id}]: {type(exc).__name__}: {exc}", flush=True)
-
-
-
-
-
-
-
-    
+       except Exception as exc:
+        print(
+            f"DOWNLOAD ERROR [{job_id}]: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
         # Keep the user-facing message actionable without exposing internal
         # paths, signed URLs, or detailed extractor diagnostics.
         message = str(exc).lower()
