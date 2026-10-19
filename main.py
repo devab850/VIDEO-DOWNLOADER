@@ -360,9 +360,14 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
                     f"best[height<={max_height}]"
                 )
         else:
-            if not any(f.get("acodec") not in (None, "none") for f in available):
-                raise ValueError("No supported audio formats found.")
-            format_selector = "bestaudio/best"
+            if direct_mp4:
+                # Generic extractor exposes a direct MP4 but may omit codec metadata.
+                # Download that verified direct-MP4 candidate, then extract audio below.
+                format_selector = str(available[0].get("format_id", "mp4"))
+            else:
+                if not any(f.get("acodec") not in (None, "none") for f in available):
+                    raise ValueError("No supported audio formats found.")
+                format_selector = "bestaudio/best"
 
         output_template = str(STORAGE_DIR / f"{job_id}.%(ext)s")
         options = {
@@ -381,11 +386,18 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
         }
 
         if download_type == "audio_mp3":
-            options["format"] = "bestaudio/best"
+            if not direct_mp4:
+                options["format"] = "bestaudio/best"
             options["postprocessors"] = [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
+            }]
+        elif download_type == "audio_original" and direct_mp4:
+            # Extract an audio-only file while preserving the source audio codec where possible.
+            options["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "best",
             }]
 
         with yt_dlp.YoutubeDL(options) as ydl:
