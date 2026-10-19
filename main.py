@@ -1,6 +1,7 @@
 
 import ipaddress
 import socket
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -133,10 +134,26 @@ def safe_info(url: str):
         return ydl.extract_info(url, download=False)
 
 
+def is_direct_mp4_info(info):
+    """Recognize yt-dlp's single direct MP4 format when codec metadata is absent."""
+    formats = info.get("formats") or []
+    if len(formats) != 1:
+        return False
+    item = formats[0]
+    return (
+        bool(item.get("url"))
+        and str(item.get("format_id", "")) == "mp4"
+        and (item.get("ext") or "").lower() == "mp4"
+        and item.get("vcodec") in (None, "")
+        and item.get("acodec") in (None, "")
+    )
+
+
 def public_formats(info):
-    """Expose only formats that yt-dlp identifies as real audio/video streams."""
+    """Expose known streams and the narrowly recognized direct-MP4 fallback."""
     result = []
     seen = set()
+    direct_mp4 = is_direct_mp4_info(info)
 
     for item in info.get("formats") or []:
         if not item.get("url"):
@@ -144,17 +161,19 @@ def public_formats(info):
 
         vcodec = item.get("vcodec")
         acodec = item.get("acodec")
+        format_id = str(item.get("format_id", ""))
+        ext = item.get("ext")
 
-        # Generic extractors can return placeholder entries with no codec data.
-        # Do not advertise those as downloadable formats.
         has_video = bool(vcodec and vcodec != "none")
         has_audio = bool(acodec and acodec != "none")
+        # yt-dlp's Generic extractor may expose one direct MP4 URL without codec
+        # metadata. Treat only this exact single-format shape as a video fallback.
+        if direct_mp4 and format_id == "mp4":
+            has_video = True
         if not has_video and not has_audio:
             continue
 
         height = item.get("height")
-        ext = item.get("ext")
-        format_id = str(item.get("format_id", ""))
         dedupe_key = (format_id, height, ext, has_video, has_audio)
         if dedupe_key in seen:
             continue
@@ -248,7 +267,14 @@ def analyze(req: AnalyzeRequest):
        
 
         formats = public_formats(info)
+        direct_mp4 = is_direct_mp4_info(info)
         video_qualities = available_video_qualities(formats)
+        if direct_mp4:
+            # These are generated max-height choices, not source-native formats.
+            video_qualities = [
+                {"value": f"{height}p", "height": height}
+                for height in (360, 480, 720, 1080)
+            ]
         has_video_stream = any(item.get("has_video") for item in formats)
         has_audio_stream = any(item.get("has_audio") for item in formats)
 
@@ -271,11 +297,13 @@ def analyze(req: AnalyzeRequest):
             "download_supported": bool(formats),
             "quality_mode": "available" if video_qualities else "auto_only",
             "quality_notice": (
+                "This source exposes one direct MP4. Selected quality will be "
+                "created up to the chosen height; the source will not be upscaled."
+                if direct_mp4 else
                 "Available resolutions are based on detected video streams."
                 if video_qualities else
                 "No explicit video resolutions were detected. Auto will try "
-                "the best supported stream; download may fail if the source "
-                "does not expose a real video stream."
+                "the best supported stream."
             ),
             "notice": (
                 "Only download content you own or are authorized "
@@ -306,22 +334,24 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             raise ValueError("Video information unavailable.")
 
         duration = info.get("duration")
-
         if duration and duration > MAX_DURATION_SECONDS:
             raise ValueError("Video exceeds the duration limit.")
 
-        formats = public_formats(info)
         available = info.get("formats") or []
+        direct_mp4 = is_direct_mp4_info(info)
 
         if download_type == "video":
-            if not any(f.get("vcodec") not in (None, "none") for f in available):
+            if not direct_mp4 and not any(
+                f.get("vcodec") not in (None, "none") for f in available
+            ):
                 raise ValueError("No supported video formats found.")
-            if quality == "auto":
-                # Prefer best video + audio, then a combined stream, then
-                # the best format yt-dlp can legitimately select.
-                format_selector = (
-                    "bestvideo*+bestaudio/best[vcodec!=none]/best"
-                )
+
+            if direct_mp4:
+                # Select the exact direct MP4 format; generic 'best' selectors can
+                # reject it because the extractor has no codec metadata.
+                format_selector = str(available[0].get("format_id", "mp4"))
+            elif quality == "auto":
+                format_selector = "bestvideo*+bestaudio/best[vcodec!=none]/best"
             else:
                 max_height = int(quality[:-1])
                 format_selector = (
@@ -335,7 +365,6 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             format_selector = "bestaudio/best"
 
         output_template = str(STORAGE_DIR / f"{job_id}.%(ext)s")
-
         options = {
             "quiet": True,
             "no_warnings": True,
@@ -367,18 +396,40 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             if path.is_file()
             and not path.name.endswith((".part", ".ytdl"))
         ]
-
         if not candidates:
             raise ValueError("Download did not produce a completed file.")
-
         file_path = max(candidates, key=lambda path: path.stat().st_size)
+
+        # A direct MP4 has no reported resolution. For a requested quality, use
+        # ffmpeg to make a copy capped at that height (never upscale a smaller source).
+        if direct_mp4 and download_type == "video" and quality != "auto":
+            max_height = int(quality[:-1])
+            transcoded_path = STORAGE_DIR / f"{job_id}_scaled.mp4"
+            command = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(file_path),
+                "-map", "0:v:0", "-map", "0:a?",
+                "-vf", fr"scale=-2:min(ih\,{max_height})",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(transcoded_path),
+            ]
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=1800, check=False
+            )
+            if result.returncode != 0 or not transcoded_path.is_file() or transcoded_path.stat().st_size == 0:
+                transcoded_path.unlink(missing_ok=True)
+                detail = (result.stderr or "").strip()[-500:]
+                raise ValueError("Could not create the requested quality version." + (f" {detail}" if detail else ""))
+            file_path.unlink(missing_ok=True)
+            file_path = transcoded_path
 
         if file_path.stat().st_size > MAX_FILE_MB * 1024 * 1024:
             file_path.unlink(missing_ok=True)
             raise ValueError("Downloaded file exceeds the size limit.")
 
         token, expires_at = issue_download_token(job_id, file_path)
-
         update_job(
             job_id,
             status="completed",
@@ -391,8 +442,6 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             f"DOWNLOAD ERROR [{job_id}]: {type(exc).__name__}: {exc}",
             flush=True,
         )
-        # Keep the user-facing message actionable without exposing internal
-        # paths, signed URLs, or detailed extractor diagnostics.
         message = str(exc).lower()
         if "no video formats" in message or "requested format is not available" in message:
             public_error = (
@@ -401,6 +450,8 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             )
         elif "no supported audio formats" in message:
             public_error = "No usable audio stream was found for this link."
+        elif "requested quality version" in message:
+            public_error = "The source downloaded, but the requested quality version could not be created."
         else:
             public_error = (
                 "Download failed. The source may be unsupported, restricted, "
