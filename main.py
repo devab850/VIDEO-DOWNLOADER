@@ -130,7 +130,9 @@ def safe_info(url: str):
 
 
 def public_formats(info):
+    """Expose only formats that yt-dlp identifies as real audio/video streams."""
     result = []
+    seen = set()
 
     for item in info.get("formats") or []:
         if not item.get("url"):
@@ -139,20 +141,29 @@ def public_formats(info):
         vcodec = item.get("vcodec")
         acodec = item.get("acodec")
 
-        if vcodec == "none" and acodec == "none":
+        # Generic extractors can return placeholder entries with no codec data.
+        # Do not advertise those as downloadable formats.
+        has_video = bool(vcodec and vcodec != "none")
+        has_audio = bool(acodec and acodec != "none")
+        if not has_video and not has_audio:
             continue
 
+        height = item.get("height")
+        ext = item.get("ext")
+        format_id = str(item.get("format_id", ""))
+        dedupe_key = (format_id, height, ext, has_video, has_audio)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
         result.append({
-            "format_id": str(item.get("format_id", "")),
-            "ext": item.get("ext"),
-            "height": item.get("height"),
+            "format_id": format_id,
+            "ext": ext,
+            "height": height,
             "width": item.get("width"),
-            "filesize": (
-                item.get("filesize")
-                or item.get("filesize_approx")
-            ),
-            "has_video": vcodec not in (None, "none"),
-            "has_audio": acodec not in (None, "none"),
+            "filesize": item.get("filesize") or item.get("filesize_approx"),
+            "has_video": has_video,
+            "has_audio": has_audio,
             "note": (item.get("format_note") or "")[:80],
         })
 
@@ -163,8 +174,20 @@ def public_formats(info):
         ),
         reverse=True,
     )
-
     return result[:40]
+
+
+def available_video_qualities(formats):
+    """Return only resolution options backed by actual video formats."""
+    heights = {
+        item.get("height")
+        for item in formats
+        if item.get("has_video") and isinstance(item.get("height"), int)
+    }
+    return [
+        {"value": f"{height}p", "height": height}
+        for height in sorted(heights, reverse=True)
+    ]
 
 
 @app.get("/")
@@ -194,6 +217,9 @@ def analyze(req: AnalyzeRequest):
             )
 
         formats = public_formats(info)
+        video_qualities = available_video_qualities(formats)
+        has_video_stream = any(item.get("has_video") for item in formats)
+        has_audio_stream = any(item.get("has_audio") for item in formats)
 
         return {
             "title": (info.get("title") or "Video")[:300],
@@ -208,7 +234,18 @@ def analyze(req: AnalyzeRequest):
                 or "Unknown"
             ),
             "formats": formats,
+            "video_qualities": video_qualities,
+            "has_video_stream": has_video_stream,
+            "has_audio_stream": has_audio_stream,
             "download_supported": bool(formats),
+            "quality_mode": "available" if video_qualities else "auto_only",
+            "quality_notice": (
+                "Available resolutions are based on detected video streams."
+                if video_qualities else
+                "No explicit video resolutions were detected. Auto will try "
+                "the best supported stream; download may fail if the source "
+                "does not expose a real video stream."
+            ),
             "notice": (
                 "Only download content you own or are authorized "
                 "to download. Restricted and DRM-protected content "
@@ -249,12 +286,17 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             if not any(f.get("vcodec") not in (None, "none") for f in available):
                 raise ValueError("No supported video formats found.")
             if quality == "auto":
-                format_selector = "best[acodec!=none][vcodec!=none]/best"
+                # Prefer best video + audio, then a combined stream, then
+                # the best format yt-dlp can legitimately select.
+                format_selector = (
+                    "bestvideo*+bestaudio/best[vcodec!=none]/best"
+                )
             else:
                 max_height = int(quality[:-1])
                 format_selector = (
-                    f"bestvideo[height<={max_height}]+bestaudio/"
-                    f"best[height<={max_height}]/best"
+                    f"bestvideo*[height<={max_height}]+bestaudio/"
+                    f"best[height<={max_height}][vcodec!=none]/"
+                    f"best[height<={max_height}]"
                 )
         else:
             if not any(f.get("acodec") not in (None, "none") for f in available):
@@ -314,15 +356,23 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
             file_name=file_path.name,
         )
 
-    except Exception:
-        update_job(
-            job_id,
-            status="failed",
-            error=(
-                "Download failed. The source may be unsupported, "
-                "restricted, or temporarily unavailable."
-            ),
-        )
+    except Exception as exc:
+        # Keep the user-facing message actionable without exposing internal
+        # paths, signed URLs, or detailed extractor diagnostics.
+        message = str(exc).lower()
+        if "no video formats" in message or "requested format is not available" in message:
+            public_error = (
+                "No usable video stream was found for this link. "
+                "Try a supported public video URL."
+            )
+        elif "no supported audio formats" in message:
+            public_error = "No usable audio stream was found for this link."
+        else:
+            public_error = (
+                "Download failed. The source may be unsupported, restricted, "
+                "or temporarily unavailable."
+            )
+        update_job(job_id, status="failed", error=public_error)
 
 
 @app.post("/api/download", status_code=202)
