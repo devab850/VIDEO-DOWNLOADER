@@ -1,12 +1,19 @@
 
 import ipaddress
 import json
+import os
+import re
 import socket
 import subprocess
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
+from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
+
+import requests
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,25 +50,104 @@ MAX_DURATION_SECONDS = 4 * 60 * 60
 MAX_FILE_MB = 1024
 CLEANUP_INTERVAL_SECONDS = 60
 
-# The source tested by the user requires this cookie-check value and a browser-like UA.
-# Keep the cookie restricted to that source family; do not send it to unrelated sites.
+# Use a browser-like User-Agent and learn simple JS cookie checks per source.
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 )
-COOKIE_CHECK_HOSTS = {"xxnx.kim"}
 
 
 def headers_for_url(url: str) -> dict:
-    """Build source-specific headers without adding the cookie to unrelated sites."""
-    headers = {
-        "User-Agent": BROWSER_USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    host = (urlparse(url).hostname or "").rstrip(".").lower()
-    if any(host == domain or host.endswith("." + domain) for domain in COOKIE_CHECK_HOSTS):
-        headers["Cookie"] = "_sv=1"
-    return headers
+    return {"User-Agent": BROWSER_USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+
+
+def _read_small_response(response, limit: int = 256 * 1024) -> str:
+    """Read a bounded prefix; never buffer an entire media file in memory."""
+    chunks = []
+    remaining = limit
+    try:
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            chunk = chunk[:remaining]
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            if remaining <= 0 or b"</html>" in chunk.lower():
+                break
+    finally:
+        response.close()
+    return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
+
+
+def _apply_simple_document_cookies(session: requests.Session, page_url: str, body: str) -> bool:
+    """Support simple JS cookie-check pages; not CAPTCHA, login, or DRM bypass."""
+    host = (urlparse(page_url).hostname or "").lower()
+    changed = False
+    assignments = re.findall(r"document\.cookie\s*=\s*[\"'](.*?)[\"']", body, flags=re.IGNORECASE | re.DOTALL)
+    for assignment in assignments:
+        parts = assignment.split(";")
+        if "=" not in parts[0]:
+            continue
+        name, value = parts[0].split("=", 1)
+        name, value = name.strip(), value.strip()
+        if not name or any(ch in name for ch in "\\r\\n;="):
+            continue
+        path, domain, secure = "/", host, False
+        for attribute in parts[1:]:
+            key, _, attr_value = attribute.strip().partition("=")
+            key = key.lower()
+            if key == "path" and attr_value.startswith("/"):
+                path = attr_value
+            elif key == "domain" and attr_value:
+                candidate = attr_value.lstrip(".").lower()
+                if host == candidate or host.endswith("." + candidate):
+                    domain = candidate
+            elif key == "secure":
+                secure = True
+        session.cookies.set(name, value, domain=domain, path=path, secure=secure)
+        changed = True
+    return changed
+
+
+@contextmanager
+def source_access(url: str):
+    """Best-effort preflight and temporary domain-scoped Netscape cookie jar.
+
+    yt-dlp remains the primary extractor. This only retries simple JS cookie pages;
+    cookies remain domain-scoped in the cookie jar instead of being sent as a raw
+    Cookie header to every CDN host. If preflight fails, yt-dlp still gets a chance.
+    """
+    session = requests.Session()
+    session.headers.update(headers_for_url(url))
+    try:
+        response = session.get(url, timeout=(5, 15), allow_redirects=True, stream=True)
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        final_url = response.url or url
+        if any(kind in content_type for kind in ("text/html", "text/plain", "application/xhtml")) or not content_type:
+            body = _read_small_response(response)
+            if "document.cookie" in body.lower() and ("location.reload" in body.lower() or "location.href" in body.lower()):
+                if _apply_simple_document_cookies(session, final_url, body):
+                    retry = session.get(final_url, timeout=(5, 15), allow_redirects=True, stream=True)
+                    retry.close()
+        else:
+            response.close()
+    except requests.RequestException as exc:
+        print(f"SOURCE PREFLIGHT NOTE: {type(exc).__name__}: {exc}", flush=True)
+
+    fd, cookie_path = tempfile.mkstemp(prefix="deva-cookies-", suffix=".txt")
+    os.close(fd)
+    try:
+        jar = MozillaCookieJar(cookie_path)
+        for cookie in session.cookies:
+            jar.set_cookie(cookie)
+        jar.save(ignore_discard=True, ignore_expires=True)
+        yield {"cookiefile": cookie_path, "http_headers": headers_for_url(url)}
+    finally:
+        session.close()
+        try:
+            os.unlink(cookie_path)
+        except OSError:
+            pass
 
 BLOCKED_HOSTS = {
     "youtube.com",
@@ -134,24 +220,23 @@ def validate_public_http_url(raw_url: str) -> str:
 
 
 def safe_info(url: str):
-   
-    opts = {
-         "cachedir": False,
-        "http_headers": headers_for_url(url),
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "socket_timeout": 15,
-        "extractor_retries": 1,
-        "retries": 1,
-        "ignoreerrors": False,
-        "no_color": True,
-        
-    }
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    with source_access(url) as access:
+        opts = {
+            "cachedir": False,
+            "http_headers": access["http_headers"],
+            "cookiefile": access["cookiefile"],
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "socket_timeout": 15,
+            "extractor_retries": 1,
+            "retries": 1,
+            "ignoreerrors": False,
+            "no_color": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
 
 
 def is_direct_mp4_info(info):
@@ -464,8 +549,11 @@ def process_download(job_id: str, url: str, download_type: str = "video", qualit
                 "preferredcodec": "best",
             }]
 
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([url])
+        with source_access(url) as access:
+            options["http_headers"] = access["http_headers"]
+            options["cookiefile"] = access["cookiefile"]
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.download([url])
 
         candidates = [
             path for path in STORAGE_DIR.glob(f"{job_id}.*")
