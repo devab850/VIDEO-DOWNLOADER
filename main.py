@@ -10,6 +10,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from typing import Literal
 import yt_dlp
 
 from download_manager import (
@@ -51,6 +52,12 @@ _cleanup_thread_started = False
 
 class AnalyzeRequest(BaseModel):
     url: str = Field(min_length=8, max_length=MAX_URL_LENGTH)
+
+
+class DownloadRequest(AnalyzeRequest):
+    # Defaults preserve the existing frontend/API behavior.
+    download_type: Literal["video", "audio_mp3", "audio_original"] = "video"
+    quality: Literal["auto", "360p", "480p", "720p", "1080p"] = "auto"
 
 
 def validate_public_http_url(raw_url: str) -> str:
@@ -219,7 +226,7 @@ def analyze(req: AnalyzeRequest):
         )
 
 
-def process_download(job_id: str, url: str):
+def process_download(job_id: str, url: str, download_type: str = "video", quality: str = "auto"):
     try:
         update_job(job_id, status="processing", error=None)
 
@@ -236,13 +243,25 @@ def process_download(job_id: str, url: str):
             raise ValueError("Video exceeds the duration limit.")
 
         formats = public_formats(info)
+        available = info.get("formats") or []
 
-        if not formats:
-            raise ValueError("No supported downloadable formats found.")
+        if download_type == "video":
+            if not any(f.get("vcodec") not in (None, "none") for f in available):
+                raise ValueError("No supported video formats found.")
+            if quality == "auto":
+                format_selector = "best[acodec!=none][vcodec!=none]/best"
+            else:
+                max_height = int(quality[:-1])
+                format_selector = (
+                    f"bestvideo[height<={max_height}]+bestaudio/"
+                    f"best[height<={max_height}]/best"
+                )
+        else:
+            if not any(f.get("acodec") not in (None, "none") for f in available):
+                raise ValueError("No supported audio formats found.")
+            format_selector = "bestaudio/best"
 
-        output_template = str(
-            STORAGE_DIR / f"{job_id}.%(ext)s"
-        )
+        output_template = str(STORAGE_DIR / f"{job_id}.%(ext)s")
 
         options = {
             "quiet": True,
@@ -253,14 +272,19 @@ def process_download(job_id: str, url: str):
             "extractor_retries": 1,
             "cachedir": False,
             "max_filesize": MAX_FILE_MB * 1024 * 1024,
-            "format": (
-                "best[acodec!=none][vcodec!=none]/"
-                "best"
-            ),
+            "format": format_selector,
             "outtmpl": output_template,
             "overwrites": False,
             "continuedl": False,
         }
+
+        if download_type == "audio_mp3":
+            options["format"] = "bestaudio/best"
+            options["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }]
 
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
@@ -302,7 +326,7 @@ def process_download(job_id: str, url: str):
 
 
 @app.post("/api/download", status_code=202)
-def download(req: AnalyzeRequest, background_tasks: BackgroundTasks):
+def download(req: DownloadRequest, background_tasks: BackgroundTasks):
     url = validate_public_http_url(req.url)
 
     job = create_job()
@@ -311,6 +335,8 @@ def download(req: AnalyzeRequest, background_tasks: BackgroundTasks):
         process_download,
         job["job_id"],
         url,
+        req.download_type,
+        req.quality,
     )
 
     return {
