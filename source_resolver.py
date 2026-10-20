@@ -38,20 +38,25 @@ _OG_TITLE_RE = re.compile(
 _OG_IMAGE_RE = re.compile(
     r"""<meta[^>]+property\s*=\s*["']og:image["'][^>]*content\s*=\s*["']([^"']*)""", re.I)
 
+# Extension must END there (so "preview.mp4.jpg" is not taken), and may be followed
+# by "/" (some engines use .../video.mp4/?token=...) and a query string.
+_EXT = r"\.(?:mp4|m3u8|webm|mpd)(?![\w.\-])/?(?:\?[^\"'\s<>\\]*)?"
+
 # Ordered by reliability. Earlier patterns win when ranking.
 _MEDIA_PATTERNS = [
     re.compile(r"""<(?:source|video)\b[^>]*?\bsrc\s*=\s*["']([^"']+)""", re.I),
     re.compile(
         r"""<meta[^>]+(?:og:video(?::url|:secure_url)?|twitter:player:stream)["'][^>]*"""
         r"""content\s*=\s*["']([^"']+)""", re.I),
+    re.compile(
+        r"""["']?(?:file|src|source|video_url|video_alt_url\d*|videoUrl|hls|stream|url)["']?\s*[:=]\s*"""
+        r"""["']([^"']+?""" + _EXT + r""")["']""", re.I),
     re.compile(r'''"contentUrl"\s*:\s*"([^"]+)"'''),
-    re.compile(
-        r"""["']?(?:file|src|source|video_url|videoUrl|hls|stream|url)["']?\s*[:=]\s*"""
-        r"""["']([^"']+?\.(?:mp4|m3u8|webm|mpd)(?:\?[^"']*)?)["']""", re.I),
-    re.compile(
-        r"""(https?://[^\s"'<>\\]+?\.(?:mp4|m3u8|webm|mpd)(?:\?[^\s"'<>\\]*)?)""", re.I),
+    re.compile(r"""(https?://[^\s"'<>\\]+?""" + _EXT + r""")""", re.I),
 ]
-_BAD_PARTS = ("vast", "splash.php", "/ads/", "doubleclick", "googlesyndication")
+_BAD_PARTS = ("vast", "splash.php", "/ads/", "doubleclick", "googlesyndication",
+              "screenshots", "/preview", "thumb")
+_TOKEN_HINT = re.compile(r"(token|acctoken|signature|signing|expires|[?&]sig=|[?&]hash=)", re.I)
 
 
 @dataclass
@@ -206,5 +211,7 @@ def inspect_page(url: str, validator: Callable[[str], None]) -> PageInfo:
                 seen.add(u)
                 info.candidates.append(Candidate(u, f_final))
 
+    # Links that carry a token/signature are the real, playable ones: try them first.
+    info.candidates.sort(key=lambda c: 0 if _TOKEN_HINT.search(c.url) else 1)
     info.candidates = info.candidates[:MAX_CANDIDATES]
     return info
