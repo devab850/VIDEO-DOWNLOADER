@@ -10,8 +10,11 @@ What it handles (without any per-site code):
 Every request is validated with the `validator` callback you pass in (SSRF guard),
 including every redirect hop.
 """
+import hashlib
 import html as htmllib
+import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
@@ -130,20 +133,77 @@ def _learn_cookies(text: str) -> Dict[str, str]:
     return found
 
 
+_POW_RE = re.compile(
+    r"""<script[^>]*\bid=["']bc["'][^>]*>\s*(\{.*?\})\s*</script>""", re.S)
+POW_MAX_SECONDS = 8
+POW_MAX_TRIES = 8_000_000
+
+
+def solve_pow_challenge(text: str) -> Optional[str]:
+    """Solve the simple "Checking your browser" proof-of-work page.
+
+    The page carries {"ch": <challenge>, "t": <target>}; the browser looks for the
+    smallest number n such that the first 32 bits of SHA-256("<ch>:<n>") are <= target,
+    then reloads the same URL with  __pow=<ch>~<n>&__t=<ms>_<tries>.
+    Returns that query string (without leading ?/&) or None if this is not such a page.
+    """
+    if "BOTCATCH" not in text or len(text) > 20000:
+        return None
+    m = _POW_RE.search(text)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+        ch, target = str(data["ch"]), int(data["t"]) & 0xFFFFFFFF
+    except (ValueError, KeyError, TypeError):
+        return None
+    prefix = (ch + ":").encode()
+    started = time.time()
+    for n in range(POW_MAX_TRIES):
+        digest = hashlib.sha256(prefix + str(n).encode()).digest()
+        if int.from_bytes(digest[:4], "big") <= target:
+            ms = int((time.time() - started) * 1000)
+            return f"__pow={ch}~{n}&__t={ms}_{n}"
+        if n % 50000 == 0 and time.time() - started > POW_MAX_SECONDS:
+            break
+    return None
+
+
+def _with_query(url: str, extra: str) -> str:
+    parts = urlparse(url)
+    query = parts.query
+    # drop an older __pow/__t so a rejected attempt is not stacked
+    query = "&".join(q for q in query.split("&") if q and not q.startswith(("__pow=", "__t=")))
+    query = f"{query}&{extra}" if query else extra
+    return parts._replace(query=query).geturl()
+
+
 def _fetch_with_cookie_check(session, url, validator, referer=None):
+    """Fetch a page, passing the two kinds of tiny "gate" pages sites use:
+    cookie-check (document.cookie=...; reload) and proof-of-work ("Checking your browser")."""
     learned: Dict[str, str] = {}
     final_url, text = url, ""
-    for _ in range(MAX_COOKIE_ROUNDS):
+    pow_tried = False
+    for _ in range(MAX_COOKIE_ROUNDS + 1):
         final_url, text = _get(session, url, validator, referer)
+
         new = _learn_cookies(text)
         fresh = {k: v for k, v in new.items() if learned.get(k) != v}
-        if not fresh:
-            break
-        learned.update(fresh)
-        host = urlparse(final_url).hostname or ""
-        for k, v in fresh.items():
-            session.cookies.set(k, v, domain=host, path="/")
-        url = final_url
+        if fresh:
+            learned.update(fresh)
+            host = urlparse(final_url).hostname or ""
+            for k, v in fresh.items():
+                session.cookies.set(k, v, domain=host, path="/")
+            url = final_url
+            continue
+
+        if not pow_tried:
+            answer = solve_pow_challenge(text)
+            if answer:
+                pow_tried = True
+                url = _with_query(final_url, answer)
+                continue
+        break
     return final_url, text, learned
 
 
@@ -233,6 +293,12 @@ def inspect_page(url: str, validator: Callable[[str], None]) -> PageInfo:
             final_url, text, found = f2, t2, found2
             cookies.update(c2)
             cookies.update(GATE_COOKIES)
+
+    host = (urlparse(final_url).hostname or "").lower()
+    for c in session.cookies:
+        dom = (c.domain or "").lstrip(".").lower()
+        if dom and (host == dom or host.endswith("." + dom)):
+            cookies.setdefault(c.name, c.value)
 
     info = PageInfo(page_url=final_url, cookies=cookies)
     info.title, info.thumbnail = _meta(text, final_url)
