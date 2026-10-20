@@ -184,17 +184,18 @@ def _meta(text: str, base_url: str):
     return title, thumb
 
 
-def inspect_page(url: str, validator: Callable[[str], None]) -> PageInfo:
-    """Fetch a page like a browser would and collect everything useful from it."""
-    session = _new_session()
-    final_url, text, cookies = _fetch_with_cookie_check(session, url, validator)
-    info = PageInfo(page_url=final_url, cookies=dict(cookies))
-    info.title, info.thumbnail = _meta(text, final_url)
+# Some sites show an "ad gate" (no player) until a cookie such as "clicked" exists.
+# These are tried ONLY when the normal page had no video, and only sent to that site.
+GATE_COOKIES = {"clicked": "1"}
 
-    seen = set()
+
+def _collect(session, url, validator):
+    """Fetch one page (+ its iframes) and return (final_url, text, learned_cookies, candidates)."""
+    final_url, text, cookies = _fetch_with_cookie_check(session, url, validator)
+    found, seen = [], set()
     for u in extract_media_urls(text, final_url):
         seen.add(u)
-        info.candidates.append(Candidate(u, final_url))
+        found.append(Candidate(u, final_url))
 
     # Players inside iframes (one level deep).
     for raw in _IFRAME_RE.findall(text)[:MAX_IFRAMES]:
@@ -209,8 +210,33 @@ def inspect_page(url: str, validator: Callable[[str], None]) -> PageInfo:
         for u in extract_media_urls(f_text, f_final):
             if u not in seen:
                 seen.add(u)
-                info.candidates.append(Candidate(u, f_final))
+                found.append(Candidate(u, f_final))
+    return final_url, text, cookies, found
 
+
+def inspect_page(url: str, validator: Callable[[str], None]) -> PageInfo:
+    """Fetch a page like a browser would and collect everything useful from it."""
+    session = _new_session()
+    final_url, text, cookies, found = _collect(session, url, validator)
+    cookies = dict(cookies)
+
+    if not found:
+        # Retry once with the "gate" cookies (same host only).
+        host = urlparse(final_url).hostname or ""
+        for k, v in GATE_COOKIES.items():
+            session.cookies.set(k, v, domain=host, path="/")
+        try:
+            f2, t2, c2, found2 = _collect(session, url, validator)
+        except Exception:
+            found2 = []
+        if found2:
+            final_url, text, found = f2, t2, found2
+            cookies.update(c2)
+            cookies.update(GATE_COOKIES)
+
+    info = PageInfo(page_url=final_url, cookies=cookies)
+    info.title, info.thumbnail = _meta(text, final_url)
+    info.candidates = found
     # Links that carry a token/signature are the real, playable ones: try them first.
     info.candidates.sort(key=lambda c: 0 if _TOKEN_HINT.search(c.url) else 1)
     info.candidates = info.candidates[:MAX_CANDIDATES]
